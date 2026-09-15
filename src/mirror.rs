@@ -789,10 +789,24 @@ pub(crate) async fn spawn_streamer_pane(
         // alive-check right before each resend keeps a late-starting streamer
         // from getting the line typed into its stdin (which would forward it to
         // the remote pane as text).
+        //
+        // A Windows host needs a wider first window. Every exec there goes
+        // through a ForceCommand wrapper that starts powershell.exe before
+        // herdr.exe: measured at 1.04-1.16s per call, against roughly 0.3s for
+        // a plain Unix host. The streamer takes more than one step before it
+        // registers, so the Unix schedule expires while a perfectly healthy
+        // launch is still in progress — and the retype then lands in the
+        // stream's stdin and reaches the remote pane as typed text.
+        let windows_host = argv.iter().any(|a| a == "--windows-host");
+        let schedule: &[u64] = if windows_host {
+            &[6000, 6000]
+        } else {
+            &[3000, 4000]
+        };
         let (local, log, state_dir) = (local.clone(), log.clone(), state_dir.to_path_buf());
         let pane_id = local_pane_id.to_string();
         tokio::spawn(async move {
-            for wait_ms in [3000u64, 4000] {
+            for &wait_ms in schedule {
                 tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
                 if crate::util::streamer_alive(&state_dir, &ssh_target, &pane_target)
                     || crate::util::pane_streamer_alive(&state_dir, &pane_id)

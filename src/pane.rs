@@ -1290,6 +1290,11 @@ impl App {
         match spawn_session(&self.args, m, cols, rows, self.next_gen, self.tx.clone()) {
             Ok(mut s) => {
                 if m == Mode::Control {
+                    // The remote pty now has this geometry. Replace the
+                    // startup floor so observe mode does not keep requesting
+                    // stale rows after control resized the pane.
+                    self.args.cols = cols;
+                    self.args.rows = rows;
                     self.last_input = Instant::now();
                     // keystrokes typed while the control session was spinning up
                     for buf in std::mem::take(&mut self.pending_input) {
@@ -2096,6 +2101,10 @@ pub async fn run(args: Args) -> Result<()> {
                         if app.mode == Mode::Control {
                             let (cols, rows) = app.control_size();
                             app.send(json!({ "type": "terminal.resize", "cols": cols, "rows": rows })).await;
+                            // Track the pty size we just set; it persists when
+                            // control is released and becomes observe's floor.
+                            app.args.cols = cols;
+                            app.args.rows = rows;
                         }
                         app.paint();
                     }

@@ -17,6 +17,9 @@ use crate::config::HostConfig;
 use crate::state::{load_state, save_state, HostState, PaneEntry, WsEntry};
 use crate::util::{Logger, Result};
 
+#[path = "orphan_gc.rs"]
+mod orphan_gc;
+
 // --- snapshot shapes (subset of the API's SessionSnapshot) ---
 
 #[derive(Debug, Clone, Deserialize)]
@@ -451,6 +454,8 @@ fn resolve_label(
 }
 
 pub struct ConvergeDeps {
+    /// Only the daemon shares its self-close tracker with the event loop.
+    pub orphan_gc: bool,
     pub local: ApiClient,
     pub remote: ApiClient,
     pub host: HostConfig,
@@ -1020,6 +1025,9 @@ pub async fn converge(deps: &ConvergeDeps) -> Result<HostState> {
     // another process is about to overwrite
     let mut state = load_state(&deps.state_dir, &deps.host.name);
     let result = converge_inner(deps, &mut state).await;
+    if result.is_err() {
+        state.orphan_candidates.clear();
+    }
     // save even on error: a crash mid-pass must not orphan created mirrors
     save_state(&deps.state_dir, &deps.host.name, &state)?;
     result.map(|()| state)
@@ -1805,6 +1813,11 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
 
     // 5. push authoritative agent status onto mirror panes
     push_statuses(deps, &remote_snap, state).await;
+    if deps.orphan_gc {
+        orphan_gc::collect(deps, state).await;
+    } else {
+        state.orphan_candidates.clear();
+    }
     Ok(())
 }
 
@@ -2376,6 +2389,7 @@ mod tests {
 
     fn mock_deps(dir: &std::path::Path, api: ApiClient) -> ConvergeDeps {
         ConvergeDeps {
+            orphan_gc: false,
             local: api.clone(),
             remote: api,
             host: ssh_host(),

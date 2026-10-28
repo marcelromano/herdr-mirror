@@ -323,6 +323,7 @@ async fn run_connected(
     *remembered_transport = remember_transport(remote_host.last_api_transport, exec_streak);
     *backoff_idx = 0;
     let deps = ConvergeDeps {
+        orphan_gc: true,
         local: ctx.local.clone(),
         remote: remote.clone(),
         host: ctx.host.clone(),
@@ -1056,6 +1057,7 @@ pub async fn cmd_once(env: Env) -> Result<()> {
         let mut remote_host = crate::remote::RemoteHost::new(h, &env.state_dir);
         let (remote, _status) = remote_host.connect_api().await?;
         converge(&ConvergeDeps {
+            orphan_gc: false,
             local: local.clone(),
             remote,
             host: h.clone(),

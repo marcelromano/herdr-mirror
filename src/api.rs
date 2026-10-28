@@ -75,6 +75,12 @@ impl ApiClient {
         serde_json::from_value(v).map_err(|e| err(format!("{method}: bad response shape: {e}")))
     }
 
+    /// Read-only foreground process evidence. Missing fields remain unknown to GC.
+    pub async fn pane_process_info(&self, pane_id: &str) -> Result<Value> {
+        let result = self.request("pane.process_info", json!({"pane_id": pane_id})).await?;
+        Ok(result.get("process_info").cloned().unwrap_or(Value::Null))
+    }
+
     async fn request_inner(&self, method: &str, params: Value) -> Result<Value> {
         let stream = timeout(CONNECT_TIMEOUT, platform::connect(&self.socket_path))
             .await

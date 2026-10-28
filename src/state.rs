@@ -86,6 +86,18 @@ pub struct HostState {
     /// permanent winner and revert the other side's drag.
     #[serde(default)]
     pub ratios: BTreeMap<String, f64>,
+    #[serde(default)]
+    pub orphan_candidates: BTreeMap<String, OrphanCandidate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrphanCandidate {
+    pub terminal_id: String,
+    pub workspace_id: String,
+    pub tab_id: String,
+    pub marker: String,
+    pub first_seen: u64,
+    pub last_seen: u64,
 }
 
 /// Marker for `hide`: this host's mirrors are off the sidebar until `show`.

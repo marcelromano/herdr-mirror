@@ -916,7 +916,7 @@ pub fn cmd_ensure(env: &Env) {
     }
 }
 
-pub fn cmd_status(env: &Env) -> Result<()> {
+pub async fn cmd_status(env: &Env) -> Result<()> {
     match running_pid(env) {
         Some(pid) => println!("daemon: running (pid {pid})"),
         None => println!(
@@ -962,6 +962,15 @@ pub fn cmd_status(env: &Env) -> Result<()> {
     for w in &config.warnings {
         println!("warning: {w}");
     }
+    let local_snap = match tokio::time::timeout(Duration::from_secs(3), async {
+        let api = ApiClient::connect(&env.local_socket).await?;
+        crate::mirror::fetch_snapshot(&api).await
+    })
+    .await
+    {
+        Ok(Ok(s)) => Some(s),
+        _ => None,
+    };
     for h in &config.hosts {
         let state = load_state(&env.state_dir, &h.name);
         let ws = state
@@ -1001,6 +1010,18 @@ pub fn cmd_status(env: &Env) -> Result<()> {
             .collect();
         if !tombs.is_empty() {
             println!("  closed mirrors (restorable): {}", tombs.join(", "));
+        }
+        match &local_snap {
+            Some(snap) => println!(
+                "{}",
+                crate::mirror::orphan_status(snap, &state, |id| crate::util::pane_streamer_alive(
+                    &env.state_dir,
+                    id
+                ))
+            ),
+            None => println!(
+                "  orphan shell suspects: unknown; protected: unknown (local herdr unreachable)"
+            ),
         }
     }
     let log_file = env.state_dir.join("daemon.log");

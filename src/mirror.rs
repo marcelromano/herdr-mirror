@@ -888,6 +888,70 @@ fn note_mapped(deps: &ConvergeDeps, state: &HostState, fresh_local_ids: &[String
     }
 }
 
+/// Read-only hints, never authorization to close a pane. Counts include panes,
+/// with their tab IDs, because a tab can contain both mapped and unmapped panes.
+pub(crate) fn orphan_status(
+    snap: &Snapshot,
+    state: &HostState,
+    alive: impl Fn(&str) -> bool,
+) -> String {
+    let workspaces: HashSet<&str> = state
+        .workspaces
+        .values()
+        .map(|w| w.local_id.as_str())
+        .collect();
+    let mapped: HashSet<&str> = state.panes.values().map(|p| p.local_id.as_str()).collect();
+    let tabs: HashSet<&str> = state.tabs.values().map(|t| t.local_id.as_str()).collect();
+    let mut suspects = Vec::new();
+    let mut protected = Vec::new();
+    for p in &snap.panes {
+        if !workspaces.contains(p.workspace_id.as_str())
+            || mapped.contains(p.pane_id.as_str())
+            || alive(&p.pane_id)
+        {
+            continue;
+        }
+        let mut reasons = Vec::new();
+        if snap
+            .panes
+            .iter()
+            .filter(|q| q.workspace_id == p.workspace_id)
+            .count()
+            <= 1
+        {
+            reasons.push("last workspace pane");
+        }
+        if tabs.contains(p.tab_id.as_str())
+            && snap.panes.iter().filter(|q| q.tab_id == p.tab_id).count() <= 1
+        {
+            reasons.push("last mapped-tab pane");
+        }
+        if snap
+            .agents
+            .iter()
+            .any(|a| a.pane_id == p.pane_id && a.has_agent())
+        {
+            reasons.push("agent");
+        }
+        let marker = |cwd: &Option<String>| {
+            cwd.as_deref().is_some_and(|c| {
+                c.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next()
+                    == Some(MIRROR_CWD_MARKER)
+            })
+        };
+        if !marker(&p.cwd) || !marker(&p.foreground_cwd) {
+            reasons.push("adopted/unknown cwd");
+        }
+        let id = format!("{} (tab {})", p.pane_id, p.tab_id);
+        if reasons.is_empty() {
+            suspects.push(id);
+        } else {
+            protected.push(format!("{id}: {}", reasons.join(", ")));
+        }
+    }
+    format!("  orphan shell suspects: {} [{}]; protected: {} [{}] (read-only hints; no collection promised)", suspects.len(), suspects.join("; "), protected.len(), protected.join("; "))
+}
+
 fn converge_lock_path(state_dir: &std::path::Path, host_name: &str) -> PathBuf {
     state_dir.join(format!("{host_name}.converge.lock"))
 }
@@ -2147,6 +2211,31 @@ mod tests {
             max_rows: None,
             api_transport: crate::config::ApiTransport::Auto,
         }
+    }
+
+    #[test]
+    fn status_suspects_protected_and_explicit_zero() {
+        let state: HostState = serde_json::from_value(json!({"workspaces":{"r":{"localId":"w"}}, "tabs":{"t":{"localId":"t"}}})).unwrap();
+        let mut snap: Snapshot = serde_json::from_value(json!({"panes":[
+            {"pane_id":"p1","workspace_id":"w","tab_id":"t", "cwd":"/tmp/.mirror-pane", "foreground_cwd":"/tmp/.mirror-pane"},
+            {"pane_id":"p2","workspace_id":"w","tab_id":"t", "cwd":"/tmp/.mirror-pane", "foreground_cwd":"/tmp/.mirror-pane"}
+        ]})).unwrap();
+        let line = orphan_status(&snap, &state, |_| false);
+        assert!(line.contains("suspects: 2"));
+        assert!(line.contains("protected: 0"));
+        snap.agents.push(serde_json::from_value(json!({"pane_id":"p1", "agent":"codex"})).unwrap());
+        snap.panes[1].foreground_cwd = Some("/home/adopted".into());
+        let line = orphan_status(&snap, &state, |_| false);
+        assert!(line.contains("suspects: 0"));
+        assert!(line.contains("agent"));
+        assert!(line.contains("adopted/unknown cwd"));
+        snap.panes.pop();
+        let line = orphan_status(&snap, &state, |_| false);
+        assert!(line.contains("suspects: 0"));
+        assert!(line.contains("last workspace pane"));
+        assert!(line.contains("last mapped-tab pane"));
+        snap.panes.clear();
+        assert!(orphan_status(&snap, &state, |_| false).contains("suspects: 0 []; protected: 0 []"));
     }
 
     fn leaf(pane_id: &str) -> LayoutNode {

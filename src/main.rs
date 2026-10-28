@@ -92,7 +92,7 @@ fn run_on(rt: &tokio::runtime::Runtime, cmd: &str, rest: &[String]) -> Result<()
             daemon::cmd_ensure(&Env::resolve()?);
             Ok(())
         }
-        "status" => daemon::cmd_status(&Env::resolve()?),
+        "status" => rt.block_on(daemon::cmd_status(&Env::resolve()?)),
         "once" => rt.block_on(daemon::cmd_once(Env::resolve()?)),
         "restore" => daemon::cmd_restore(
             &Env::resolve()?,

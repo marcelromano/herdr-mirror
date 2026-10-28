@@ -33,13 +33,27 @@ pub struct EventEnvelope {
 #[derive(Clone)]
 pub struct ApiClient {
     socket_path: PathBuf,
+    #[cfg(test)]
+    mock: Option<std::sync::Arc<dyn Fn(&str, Value) -> Result<Value> + Send + Sync>>,
 }
 
 impl ApiClient {
+    #[cfg(test)]
+    pub(crate) fn mock(
+        handler: impl Fn(&str, Value) -> Result<Value> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            socket_path: PathBuf::new(),
+            mock: Some(std::sync::Arc::new(handler)),
+        }
+    }
+
     /// Connect-check the socket (one ping round-trip), then hand back a client.
     pub async fn connect(socket_path: &Path) -> Result<ApiClient> {
         let client = ApiClient {
             socket_path: socket_path.to_path_buf(),
+            #[cfg(test)]
+            mock: None,
         };
         client.request("ping", json!({})).await?;
         Ok(client)
@@ -47,6 +61,10 @@ impl ApiClient {
 
     /// One request on a fresh connection; the server closes after responding.
     pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
+        #[cfg(test)]
+        if let Some(mock) = &self.mock {
+            return mock(method, params);
+        }
         timeout(REQUEST_TIMEOUT, self.request_inner(method, params))
             .await
             .map_err(|_| err(format!("api timeout: {method}")))?

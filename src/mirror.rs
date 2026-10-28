@@ -944,10 +944,11 @@ pub async fn converge(deps: &ConvergeDeps) -> Result<HostState> {
             }
             Err(e) => {
                 deps.log.log(&format!(
-                    "[{}] converge lock unavailable ({e}) — converging unlocked",
-                    deps.host.name
+                    "[{}] converge lock unavailable at {} ({e}) — skipping this pass",
+                    deps.host.name,
+                    converge_lock_path(&deps.state_dir, &deps.host.name).display()
                 ));
-                break None;
+                return Ok(load_state(&deps.state_dir, &deps.host.name));
             }
         }
     };
@@ -2208,6 +2209,129 @@ mod tests {
         drop(first);
         assert!(try_converge_lock(&dir, "windows").unwrap().is_some());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn test_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "mirror-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn lock_subprocess_helper() {
+        let Ok(dir) = std::env::var("MIRROR_TEST_LOCK_DIR") else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        if std::env::var("MIRROR_TEST_LOCK_ROLE").unwrap() == "holder" {
+            let _held = try_converge_lock(&dir, "vps").unwrap().unwrap();
+            std::fs::write(dir.join("ready"), b"ready").unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+            while !dir.join("exit").exists() {
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            // Deliberately bypass File::drop: OS must release the process lock.
+            std::process::exit(0);
+        } else {
+            assert!(try_converge_lock(&dir, "vps").unwrap().is_none());
+            let before = std::time::Instant::now();
+            let api =
+                ApiClient::mock(|method, _| panic!("contended converge must not call {method}"));
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(converge(&mock_deps(&dir, api)))
+                .unwrap();
+            assert!(before.elapsed() >= CONVERGE_LOCK_WAIT);
+            assert!(before.elapsed() < CONVERGE_LOCK_WAIT + std::time::Duration::from_secs(5));
+            assert!(!dir.join("vps-map.json").exists());
+        }
+    }
+
+    #[test]
+    fn lock_real_process_contention_and_holder_death() {
+        let dir = test_dir("process");
+        let spawn = |role| {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "mirror::tests::lock_subprocess_helper",
+                    "--nocapture",
+                ])
+                .env("MIRROR_TEST_LOCK_DIR", &dir)
+                .env("MIRROR_TEST_LOCK_ROLE", role)
+                .spawn()
+                .unwrap()
+        };
+        let mut holder = spawn("holder");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !dir.join("ready").exists() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(spawn("contender").wait().unwrap().success());
+        std::fs::write(dir.join("exit"), b"exit").unwrap();
+        assert!(holder.wait().unwrap().success());
+        assert!(try_converge_lock(&dir, "vps").unwrap().is_some());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn mock_deps(dir: &std::path::Path, api: ApiClient) -> ConvergeDeps {
+        ConvergeDeps {
+            local: api.clone(),
+            remote: api,
+            host: ssh_host(),
+            state_dir: dir.into(),
+            log: Logger::new(dir, false),
+            close_remote_on_local_close: false,
+            closes: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn converge_noncontention_error_has_no_effects() {
+        let dir = test_dir("fail-closed");
+        let before = br#"{"panes":{"r":{"localId":"p","seq":0}}}"#;
+        std::fs::write(dir.join("vps-map.json"), before).unwrap();
+        std::fs::create_dir(converge_lock_path(&dir, "vps")).unwrap();
+        let api = ApiClient::mock(|method, _| panic!("unexpected pane/server effect: {method}"));
+        let deps = mock_deps(&dir, api);
+        converge(&deps).await.unwrap();
+        assert_eq!(std::fs::read(dir.join("vps-map.json")).unwrap(), before);
+        let log = std::fs::read_to_string(dir.join("daemon.log")).unwrap();
+        assert!(log.contains("skipping this pass"));
+        assert!(log.contains("vps.converge.lock"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn complete_converge_holds_lock_during_mock_snapshot() {
+        let dir = test_dir("integration");
+        let check_dir = dir.clone();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = calls.clone();
+        let api = ApiClient::mock(move |method, _| {
+            assert!(
+                try_converge_lock(&check_dir, "vps").unwrap().is_none(),
+                "converge must hold lock before any RPC"
+            );
+            assert_eq!(method, "session.snapshot");
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(json!({"snapshot": {}}))
+        });
+        converge(&mock_deps(&dir, api)).await.unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(try_converge_lock(&dir, "vps").unwrap().is_some());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn tombstoned(local_id: &str) -> PaneEntry {

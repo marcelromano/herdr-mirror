@@ -888,8 +888,71 @@ fn note_mapped(deps: &ConvergeDeps, state: &HostState, fresh_local_ids: &[String
     }
 }
 
+fn converge_lock_path(state_dir: &std::path::Path, host_name: &str) -> PathBuf {
+    state_dir.join(format!("{host_name}.converge.lock"))
+}
+
+/// Try once to take the per-host converge lock. `Ok(None)` = another process
+/// holds it.
+pub(crate) fn try_converge_lock(
+    state_dir: &std::path::Path,
+    host_name: &str,
+) -> std::io::Result<Option<std::fs::File>> {
+    std::fs::create_dir_all(state_dir)?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(converge_lock_path(state_dir, host_name))?;
+    match crate::platform::try_lock(&file) {
+        Ok(()) => Ok(Some(file)),
+        // Windows reports contention as ERROR_LOCK_VIOLATION, not WouldBlock
+        Err(e)
+            if e.kind() == std::io::ErrorKind::WouldBlock
+                || e.raw_os_error() == fs2::lock_contended_error().raw_os_error() =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+const CONVERGE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// Returns the post-converge state so callers don't re-read the state file.
+///
+/// Serialized per host across processes. The daemon and the `once` timer used
+/// to converge the same host concurrently: both loaded the map, both saw a new
+/// remote pane as unmapped, both created a local pane for it, and the last
+/// `save_state` won. The loser's pane was never mapped (so never closed when
+/// the remote pane went away) and its streamer claim found the other one
+/// already streaming, so it was left as a bare shell — the orphan tabs.
 pub async fn converge(deps: &ConvergeDeps) -> Result<HostState> {
+    let deadline = std::time::Instant::now() + CONVERGE_LOCK_WAIT;
+    let _lock = loop {
+        match try_converge_lock(&deps.state_dir, &deps.host.name) {
+            Ok(Some(f)) => break Some(f),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            Ok(None) => {
+                deps.log.log(&format!(
+                    "[{}] another converge still holds the lock — skipping this pass",
+                    deps.host.name
+                ));
+                return Ok(load_state(&deps.state_dir, &deps.host.name));
+            }
+            Err(e) => {
+                deps.log.log(&format!(
+                    "[{}] converge lock unavailable ({e}) — converging unlocked",
+                    deps.host.name
+                ));
+                break None;
+            }
+        }
+    };
+    // loaded only once the lock is held, so a pass never works from a map
+    // another process is about to overwrite
     let mut state = load_state(&deps.state_dir, &deps.host.name);
     let result = converge_inner(deps, &mut state).await;
     // save even on error: a crash mid-pass must not orphan created mirrors
@@ -2125,6 +2188,26 @@ mod tests {
         assert_eq!(sibs, vec!["p2".to_string()]);
 
         assert!(locate_in_layout(&tree, "nope").is_none());
+    }
+
+    #[test]
+    fn converge_lock_excludes_a_second_holder_per_host() {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-mirror-converge-lock-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let first = try_converge_lock(&dir, "windows").unwrap();
+        assert!(first.is_some());
+        assert!(try_converge_lock(&dir, "windows").unwrap().is_none());
+        // other hosts are independent
+        assert!(try_converge_lock(&dir, "hermes").unwrap().is_some());
+        drop(first);
+        assert!(try_converge_lock(&dir, "windows").unwrap().is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn tombstoned(local_id: &str) -> PaneEntry {

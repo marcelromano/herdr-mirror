@@ -55,7 +55,12 @@ fn open_daemon_lock(env: &Env) -> Result<fs::File> {
 fn try_lock(file: &fs::File) -> Result<bool> {
     match platform::try_lock(file) {
         Ok(()) => Ok(true),
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
+        Err(e)
+            if e.kind() == std::io::ErrorKind::WouldBlock
+                || e.raw_os_error() == fs2::lock_contended_error().raw_os_error() =>
+        {
+            Ok(false)
+        }
         Err(e) => Err(e.into()),
     }
 }
@@ -1181,6 +1186,19 @@ mod tests {
         assert_eq!(running_pid(&env), Some(std::process::id() as i32));
         drop(owner);
         let _ = fs::remove_dir_all(&env.state_dir);
+    }
+
+    #[test]
+    fn daemon_contention_is_already_running_not_io_error() {
+        let env = lock_test_env("direct-contention");
+        let first = open_daemon_lock(&env).unwrap();
+        let second = open_daemon_lock(&env).unwrap();
+        assert!(try_lock(&first).unwrap());
+        assert!(!try_lock(&second).expect("contention is already running, not an error"));
+        drop(first);
+        assert!(try_lock(&second).unwrap());
+        drop(second);
+        fs::remove_dir_all(&env.state_dir).unwrap();
     }
 
     #[test]

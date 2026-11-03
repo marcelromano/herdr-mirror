@@ -331,3 +331,15 @@ fn unknown_process_is_not_idle() {
         p
     ));
 }
+
+#[test]
+fn rid_label_roundtrip_and_unmapped_mark_not_collected() {
+    let p = json!({"label": crate::mirror::rid_label("w7:p15")});
+    assert_eq!(crate::mirror::pane_rid(&p), Some("w7:p15"));
+    assert_eq!(crate::mirror::pane_rid(&json!({"label":"mirror:"})), None);
+    assert_eq!(crate::mirror::pane_rid(&json!({"label":"x"})), None);
+    let inv = Inventory { panes: vec![], agents: vec![] };
+    let st = HostState::default();
+    let marked = json!({"pane_id":"p9","workspace_id":"w","label":"mirror:w7:p15"});
+    assert!(!eligible(&inv, &marked, &st));
+}

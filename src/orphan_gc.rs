@@ -188,6 +188,11 @@ fn eligible(inv: &Inventory, p: &Value, state: &HostState) -> bool {
     let Some(id) = text(p, "pane_id") else {
         return false;
     };
+    // A copy marked with a rid the state doesn't know yet is awaiting adoption
+    // by reconcile; one whose rid maps elsewhere is a duplicate (fair game).
+    if crate::mirror::pane_rid(p).is_some_and(|r| !state.panes.contains_key(r)) {
+        return false;
+    }
     state
         .workspaces
         .values()

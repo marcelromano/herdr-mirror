@@ -697,6 +697,7 @@ async fn split_mirror_pane(
     direction: &str,
     ratio: Option<f64>,
     cwd: &str,
+    rid: &str,
 ) -> Result<String> {
     #[derive(Deserialize)]
     struct Split {
@@ -711,12 +712,45 @@ async fn split_mirror_pane(
         "direction": direction,
         "cwd": cwd,
         "focus": false,
+        "env": { RID_ENV: rid },
     });
     if let Some(r) = ratio {
         params["ratio"] = json!(r);
     }
     let split: Split = local.request_t("pane.split", params).await?;
+    // Env is invisible to the API; the label is what snapshots expose, so the
+    // GC and reconcile can recognise the copy by rid. Best effort.
+    let _ = local
+        .request(
+            "pane.rename",
+            json!({ "pane_id": split.pane.pane_id, "label": rid_label(rid) }),
+        )
+        .await;
     Ok(split.pane.pane_id)
+}
+
+/// Env var set on a mirror copy's shell: the remote pane id it mirrors.
+pub(crate) const RID_ENV: &str = "HERDR_MIRROR_RID";
+const RID_LABEL_PREFIX: &str = "mirror:";
+pub(crate) fn rid_label(rid: &str) -> String {
+    format!("{RID_LABEL_PREFIX}{rid}")
+}
+/// The rid a local pane's label marks it with, if any.
+pub(crate) fn pane_rid(p: &Value) -> Option<&str> {
+    p.get("label")?
+        .as_str()?
+        .strip_prefix(RID_LABEL_PREFIX)
+        .filter(|r| !r.is_empty())
+}
+/// A live local pane already marked for `rid` (1 copy per rid): adopt it
+/// rather than splitting a duplicate. None on any doubt, including API errors.
+async fn find_marked(local: &ApiClient, rid: &str) -> Option<String> {
+    let v = local.request("session.snapshot", json!({})).await.ok()?;
+    v["snapshot"]["panes"]
+        .as_array()?
+        .iter()
+        .find(|p| pane_rid(p) == Some(rid))
+        .and_then(|p| p["pane_id"].as_str().map(String::from))
 }
 
 /// Exec the streamer into an already-created plain pane. Not `agent.start` (or a
@@ -1811,19 +1845,27 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                     else {
                         continue;
                     };
-                    let local_id = split_mirror_pane(
-                        &deps.local,
-                        &target,
-                        &place.direction,
-                        Some(place.ratio),
-                        &cwd,
-                    )
-                    .await?;
+                    let adopted = find_marked(&deps.local, &place.pane).await;
+                    let was_adopted = adopted.is_some();
+                    let local_id = match adopted {
+                        Some(id) => id,
+                        None => {
+                            split_mirror_pane(
+                                &deps.local,
+                                &target,
+                                &place.direction,
+                                Some(place.ratio),
+                                &cwd,
+                                &place.pane,
+                            )
+                            .await?
+                        }
+                    };
                     // the remote has this pane on the split's first side, and
                     // pane.split always lands the new one second. Swapping puts
                     // it where the remote has it; the split's ratio rides along
                     // untouched, so the geometry matches exactly.
-                    if place.swap {
+                    if place.swap && !was_adopted {
                         let _ = deps
                             .local
                             .request(
@@ -1887,8 +1929,20 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                         "{}: remote pane {} sits beside a subtree — mirroring it beside {target} instead; split sizes for this tab won't track",
                         rtab.tab_id, rp.pane_id
                     ));
-                    let local_id =
-                        split_mirror_pane(&deps.local, &target, &direction, None, &cwd).await?;
+                    let local_id = match find_marked(&deps.local, &rp.pane_id).await {
+                        Some(id) => id,
+                        None => {
+                            split_mirror_pane(
+                                &deps.local,
+                                &target,
+                                &direction,
+                                None,
+                                &cwd,
+                                &rp.pane_id,
+                            )
+                            .await?
+                        }
+                    };
                     state.panes.insert(
                         rp.pane_id.clone(),
                         PaneEntry {

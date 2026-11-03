@@ -132,7 +132,7 @@ pub struct LayoutSnapshot {
     pub panes: Vec<LayoutPaneSnapshot>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct Snapshot {
     #[serde(default)]
     pub workspaces: Vec<WsInfo>,
@@ -867,6 +867,161 @@ fn pane_is_mirror(p: &PaneInfo) -> bool {
     is_marker(&p.foreground_cwd) || is_marker(&p.cwd)
 }
 
+/// What to do with the local copy of a remote pane that went away.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PaneReap {
+    /// close exactly this local id (the one stored in the map)
+    Close(String),
+    /// nothing to close (tombstoned, or the copy is already gone locally)
+    Absent,
+    /// refuse and log: unsafe or ambiguous to close
+    Refuse(&'static str),
+}
+
+/// remote pane id → local pane ids whose streamer process is showing it
+/// (identified by the live streamer argv, not by any stored id).
+pub(crate) type StreamerKeys = HashMap<String, Vec<String>>;
+
+/// `(ssh target, remote pane id)` of a streamer argv
+/// (`herdr-mirror pane <target> <rid> ...`), if it is one.
+pub(crate) fn streamer_key(argv: &[Value]) -> Option<(String, String)> {
+    let s = |i: usize| argv.get(i).and_then(|v| v.as_str());
+    if !s(0)?.ends_with("herdr-mirror") || s(1)? != "pane" {
+        return None;
+    }
+    Some((s(2)?.to_string(), s(3)?.to_string()))
+}
+
+/// Ask herdr (`pane.process_info`, the same source heal uses) what each local
+/// mirror-marked pane is streaming, and index it by remote pane id for this
+/// host's `target`. The streamer argv is the one stable link between a copy
+/// and its remote pane that survives the local id changing.
+pub(crate) async fn collect_streamer_keys(local: &ApiClient, snap: &Snapshot, target: &str) -> StreamerKeys {
+    let mut keys = StreamerKeys::new();
+    for p in snap.panes.iter().filter(|p| pane_is_mirror(p)) {
+        let Ok(v) = local.request("pane.process_info", json!({ "pane_id": p.pane_id })).await else { continue };
+        let Some(procs) = v.pointer("/process_info/foreground_processes").and_then(|x| x.as_array()) else {
+            continue;
+        };
+        for pr in procs {
+            let Some(argv) = pr.get("argv").and_then(|a| a.as_array()) else { continue };
+            if let Some((t, rid)) = streamer_key(argv) {
+                if t == target {
+                    let e = keys.entry(rid).or_default();
+                    if !e.contains(&p.pane_id) {
+                        e.push(p.pane_id.clone());
+                    }
+                }
+            }
+        }
+    }
+    keys
+}
+
+fn foreign_agent_on(local: &Snapshot, pane: &PaneInfo) -> bool {
+    !pane_is_mirror(pane) && local.agents.iter().any(|a| a.pane_id == pane.pane_id && a.has_agent())
+}
+
+/// Decide whether the copy of remote pane `rid` may be closed. The copy is
+/// found by its streamer key first (`keys`), and by the id stored in the map
+/// only when no pane streams `rid`. Exactly one keyed pane → close it (the
+/// stored id may be stale); several → refuse; none → the stored id, if it is
+/// still a pane. Pure, so the guards are testable without a live herdr.
+pub(crate) fn plan_pane_reap(rid: &str, state: &HostState, local: &Snapshot, keys: &StreamerKeys) -> PaneReap {
+    let Some(entry) = state.panes.get(rid) else { return PaneReap::Absent };
+    if entry.is_tombstoned() {
+        return PaneReap::Absent;
+    }
+    let keyed = keys.get(rid).map(|v| v.as_slice()).unwrap_or(&[]);
+    let id: &str = match keyed {
+        [] => entry.local_id.as_str(),
+        [one] => one.as_str(),
+        _ => return PaneReap::Refuse("several mirror panes stream this remote pane"),
+    };
+    if id.is_empty() {
+        return PaneReap::Refuse("empty local id in map");
+    }
+    if state.panes.iter().any(|(k, e)| k != rid && e.local_id == id) {
+        return PaneReap::Refuse("local id shared by several map entries");
+    }
+    let mut matching = local.panes.iter().filter(|p| p.pane_id == id);
+    let Some(pane) = matching.next() else { return PaneReap::Absent };
+    if matching.next().is_some() {
+        return PaneReap::Refuse("local id ambiguous in snapshot");
+    }
+    // herdr reuses freed ids: a live agent on a pane that is not one of our
+    // streamer panes is somebody else's session, never ours to close
+    if foreign_agent_on(local, pane) {
+        return PaneReap::Refuse("pane has a live agent and is not a mirror copy");
+    }
+    PaneReap::Close(id.to_string())
+}
+
+/// Mirror panes streaming a remote pane that is neither mapped nor present on
+/// the remote. Returns `(close_now, seen_now)`: only ids that were already in
+/// `prev_seen` are closed, so a copy mid-creation (streamer up before the map
+/// is saved) is never reaped on first sight. `seen_now` replaces `prev_seen`.
+pub(crate) fn plan_orphan_sweep(
+    state: &HostState,
+    local: &Snapshot,
+    remote_pane_ids: &HashSet<&str>,
+    keys: &StreamerKeys,
+    prev_seen: &std::collections::BTreeSet<String>,
+) -> (Vec<(String, String)>, std::collections::BTreeSet<String>) {
+    let mapped_local: HashSet<&str> = state.panes.values().map(|e| e.local_id.as_str()).collect();
+    let mut close = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for (rid, ids) in keys {
+        if state.panes.contains_key(rid) || remote_pane_ids.contains(rid.as_str()) {
+            continue;
+        }
+        for id in ids {
+            let Some(pane) = local.panes.iter().find(|p| &p.pane_id == id) else { continue };
+            if mapped_local.contains(id.as_str()) || foreign_agent_on(local, pane) || !pane_is_mirror(pane) {
+                continue;
+            }
+            if prev_seen.contains(id) {
+                close.push((rid.clone(), id.clone()));
+            } else {
+                seen.insert(id.clone());
+            }
+        }
+    }
+    (close, seen)
+}
+
+/// Carry out a `PaneReap`. Returns true when the map entry may be dropped:
+/// closed, already gone, or refused (logged, not retried forever). False only
+/// on a transient close failure, so the next pass retries.
+pub(crate) async fn execute_pane_reap(
+    local: &ApiClient,
+    log: &Logger,
+    rid: &str,
+    stored_id: &str,
+    plan: PaneReap,
+    mark: impl FnOnce(&str),
+) -> bool {
+    match plan {
+        PaneReap::Absent => true,
+        PaneReap::Refuse(why) => {
+            log.log(&format!("remote pane {rid} gone — NOT closing mirror {stored_id:?}: {why}"));
+            true
+        }
+        PaneReap::Close(id) => {
+            log.log(&format!("remote pane {rid} gone — closing mirror {id}"));
+            mark(&id);
+            match local.request("pane.close", json!({ "pane_id": id })).await {
+                Ok(_) => true,
+                Err(e) if e.to_string().contains("not found") => true,
+                Err(e) => {
+                    log.log(&format!("close of mirror {id} for {rid} failed: {e} — will retry"));
+                    false
+                }
+            }
+        }
+    }
+}
+
 // --- the converge pass ---
 
 /// A fresh local id just entered the map (mirror created or adopted). Two
@@ -1248,14 +1403,46 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
         .filter(|rid| absent_twice(rid, &remote_pane_ids))
         .cloned()
         .collect();
+    // streamer keys: needed to find a copy whose stored id went stale, and to
+    // sweep orphans. Costs one process_info per mirror pane, so only when some
+    // mirror pane is unmapped or a remote pane just went away.
+    let mapped_now: HashSet<&str> = state.panes.values().map(|e| e.local_id.as_str()).collect();
+    let need_keys = !gone_panes.is_empty()
+        || local_snap
+            .panes
+            .iter()
+            .any(|p| pane_is_mirror(p) && !mapped_now.contains(p.pane_id.as_str()));
+    let keys = if need_keys {
+        collect_streamer_keys(&deps.local, &local_snap, &deps.host.target).await
+    } else {
+        StreamerKeys::new()
+    };
     for rid in gone_panes {
-        let entry = state.panes.remove(&rid).unwrap();
-        if !entry.is_tombstoned() && local_pane_ids.contains(entry.local_id.as_str()) {
-            mark_self_close(deps, &entry.local_id);
-            let _ = deps
-                .local
-                .request("pane.close", json!({ "pane_id": entry.local_id }))
-                .await;
+        // close the copy (by streamer key, else the stored id), then drop the
+        // entry only once the close is settled — a transient failure keeps it
+        let plan = plan_pane_reap(&rid, state, &local_snap, &keys);
+        let id = state.panes.get(&rid).map(|e| e.local_id.clone()).unwrap_or_default();
+        if execute_pane_reap(&deps.local, log, &rid, &id, plan, |l| mark_self_close(deps, l)).await {
+            state.panes.remove(&rid);
+        }
+    }
+    // orphans: mirror panes streaming a remote pane that is neither mapped nor
+    // on the remote (the copies earlier passes left behind), after 2 passes
+    let (orphans, seen) =
+        plan_orphan_sweep(state, &local_snap, &remote_pane_ids, &keys, &state.orphan_seen);
+    state.orphan_seen = seen;
+    for (rid, id) in orphans {
+        log.log(&format!(
+            "orphan mirror pane {id} streams {rid}, unmapped and absent remotely — closing"
+        ));
+        mark_self_close(deps, &id);
+        match deps.local.request("pane.close", json!({ "pane_id": id })).await {
+            Ok(_) => {}
+            Err(e) if e.to_string().contains("not found") => {}
+            Err(e) => {
+                log.log(&format!("orphan close of {id} failed: {e} — will retry"));
+                state.orphan_seen.insert(id);
+            }
         }
     }
     // record this pass's remote ids for the next comparison
@@ -1960,12 +2147,20 @@ pub async fn apply_remote_closes(
             let _ = local
                 .request("tab.close", json!({ "tab_id": entry.local_id }))
                 .await;
-        } else if let Some(entry) = state.panes.remove(rid) {
-            changed = true;
-            if !entry.is_tombstoned() {
-                let _ = local
-                    .request("pane.close", json!({ "pane_id": entry.local_id }))
-                    .await;
+        } else if state.panes.contains_key(rid) {
+            let Ok(local_snap) = fetch_snapshot(local).await else {
+                log.log(&format!(
+                    "remote pane {rid} closed — local snapshot unavailable, keeping mapping"
+                ));
+                continue;
+            };
+            let plan = plan_pane_reap(rid, &state, &local_snap, &StreamerKeys::new());
+            let id = state.panes.get(rid).map(|e| e.local_id.clone()).unwrap_or_default();
+            // no self-close mark here: this path never had one (closes.rs echo is
+            // handled by the daemon event loop for explicit remote closes)
+            if execute_pane_reap(local, log, rid, &id, plan, |_| {}).await {
+                state.panes.remove(rid);
+                changed = true;
             }
         }
     }
@@ -2164,6 +2359,181 @@ pub async fn regroup_sidebar(local: &ApiClient, prefixes: &[String], log: &Logge
 #[cfg(test)]
 mod tests {
     use super::hidden_close_plan;
+
+    // --- M1: orphaned mirror panes ---
+
+    use super::{execute_pane_reap, plan_pane_reap, PaneReap, PaneInfo, Snapshot, AgentInfo};
+    use crate::api::ApiClient;
+    use crate::state::PaneEntry;
+    use crate::util::Logger;
+    use std::sync::{Arc, Mutex};
+
+    fn no_keys() -> super::StreamerKeys {
+        super::StreamerKeys::new()
+    }
+
+    fn pane_entry(local: &str, tomb: bool) -> PaneEntry {
+        PaneEntry { local_id: local.into(), tombstone: tomb.then_some(true), seq: 0, reported: None }
+    }
+
+    fn lpane(id: &str, cwd: Option<&str>) -> PaneInfo {
+        PaneInfo {
+            pane_id: id.into(),
+            tab_id: "t".into(),
+            workspace_id: "w".into(),
+            label: None,
+            cwd: cwd.map(String::from),
+            foreground_cwd: None,
+        }
+    }
+
+    fn snap(panes: Vec<PaneInfo>, agent_on: &[&str]) -> Snapshot {
+        Snapshot {
+            panes,
+            agents: agent_on
+                .iter()
+                .map(|id| AgentInfo { pane_id: id.to_string(), agent: Some("claude".into()), ..Default::default() })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn state_with(rid: &str, e: PaneEntry) -> HostState {
+        let mut s = HostState::default();
+        s.panes.insert(rid.into(), e);
+        s
+    }
+
+    #[test]
+    fn gone_remote_pane_closes_the_copy_stored_in_the_map() {
+        let st = state_with("wN:p1", pane_entry("w6E:p9", false));
+        let sn = snap(vec![lpane("w6E:p9", Some("/x/.mirror-pane"))], &["w6E:p9"]);
+        assert_eq!(plan_pane_reap("wN:p1", &st, &sn, &no_keys()), PaneReap::Close("w6E:p9".into()));
+    }
+
+    #[test]
+    fn a_recalculated_id_never_matters_only_the_stored_one() {
+        // the converge-order id (w6E:p1) differs from the stored one: the plan
+        // still names the stored id, and leaves the other pane alone
+        let st = state_with("wN:p1", pane_entry("w6E:p9", false));
+        let sn = snap(vec![lpane("w6E:p1", None), lpane("w6E:p9", Some("/x/.mirror-pane"))], &[]);
+        assert_eq!(plan_pane_reap("wN:p1", &st, &sn, &no_keys()), PaneReap::Close("w6E:p9".into()));
+    }
+
+    #[test]
+    fn pane_outside_the_map_is_never_closed() {
+        let st = state_with("wN:p1", pane_entry("w6E:p9", false));
+        let sn = snap(vec![lpane("w6E:p5", Some("/x/.mirror-pane"))], &[]);
+        assert_eq!(plan_pane_reap("wN:p1", &st, &sn, &no_keys()), PaneReap::Absent);
+        assert_eq!(plan_pane_reap("wN:unknown", &st, &sn, &no_keys()), PaneReap::Absent);
+    }
+
+    #[test]
+    fn foreign_live_agent_on_reused_id_is_refused() {
+        let st = state_with("wN:p1", pane_entry("w6E:p9", false));
+        let sn = snap(vec![lpane("w6E:p9", Some("/home/u/proj"))], &["w6E:p9"]);
+        assert!(matches!(plan_pane_reap("wN:p1", &st, &sn, &no_keys()), PaneReap::Refuse(_)));
+    }
+
+    #[test]
+    fn tombstoned_empty_and_shared_ids_are_not_closed() {
+        let sn = snap(vec![lpane("w6E:p9", None)], &[]);
+        assert_eq!(plan_pane_reap("r", &state_with("r", pane_entry("w6E:p9", true)), &sn, &no_keys()), PaneReap::Absent);
+        assert!(matches!(
+            plan_pane_reap("r", &state_with("r", pane_entry("", false)), &sn, &no_keys()),
+            PaneReap::Refuse(_)
+        ));
+        let mut st = state_with("r", pane_entry("w6E:p9", false));
+        st.panes.insert("r2".into(), pane_entry("w6E:p9", false));
+        assert!(matches!(plan_pane_reap("r", &st, &sn, &no_keys()), PaneReap::Refuse(_)));
+    }
+
+    /// Fake herdr socket: records methods, answers pane.close per `reply`.
+    async fn fake_herdr(
+        dir: &std::path::Path,
+        reply: &'static str,
+    ) -> (ApiClient, Arc<Mutex<Vec<(String, serde_json::Value)>>>) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let path = dir.join("fake.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen2 = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((st, _)) = listener.accept().await else { return };
+                let seen = seen2.clone();
+                tokio::spawn(async move {
+                    let (r, mut w) = st.into_split();
+                    let mut lines = BufReader::new(r).lines();
+                    if let Ok(Some(l)) = lines.next_line().await {
+                        let v: serde_json::Value = serde_json::from_str(&l).unwrap();
+                        seen.lock().unwrap().push((
+                            v["method"].as_str().unwrap().to_string(),
+                            v["params"].clone(),
+                        ));
+                        let out = match reply {
+                            "ok" => serde_json::json!({"id": v["id"], "result": {}}),
+                            "notfound" => serde_json::json!({"id": v["id"], "error": {"message": "pane w6E:p9 not found"}}),
+                            _ => serde_json::json!({"id": v["id"], "error": {"message": "boom"}}),
+                        };
+                        let _ = w.write_all((out.to_string() + "\n").as_bytes()).await;
+                    }
+                });
+            }
+        });
+        (ApiClient::connect_unchecked(&path), seen)
+    }
+
+    fn tmpdir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("hm-m1-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[tokio::test]
+    async fn execute_closes_stored_id_and_repeat_is_idempotent() {
+        let d = tmpdir("exec");
+        let (api, seen) = fake_herdr(&d, "ok").await;
+        let log = Logger::new(&d, false);
+        let marked = Arc::new(Mutex::new(Vec::new()));
+        let m = marked.clone();
+        let plan = PaneReap::Close("w6E:p9".into());
+        assert!(execute_pane_reap(&api, &log, "wN:p1", "w6E:p9", plan, move |l| m.lock().unwrap().push(l.to_string())).await);
+        assert_eq!(marked.lock().unwrap().as_slice(), ["w6E:p9"]);
+        {
+            let s = seen.lock().unwrap();
+            assert_eq!(s.len(), 1);
+            assert_eq!(s[0].0, "pane.close");
+            assert_eq!(s[0].1["pane_id"], "w6E:p9");
+        }
+        // repeated warning: entry already dropped / copy gone => no further close
+        let st = HostState::default();
+        let sn = snap(vec![], &[]);
+        let again = plan_pane_reap("wN:p1", &st, &sn, &no_keys());
+        assert!(execute_pane_reap(&api, &log, "wN:p1", "", again, |_| {}).await);
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn not_found_counts_as_done_and_other_errors_retry() {
+        let d = tmpdir("err");
+        let (api, _) = fake_herdr(&d, "notfound").await;
+        let log = Logger::new(&d, false);
+        assert!(execute_pane_reap(&api, &log, "r", "w6E:p9", PaneReap::Close("w6E:p9".into()), |_| {}).await);
+        let d2 = tmpdir("err2");
+        let (api2, _) = fake_herdr(&d2, "boom").await;
+        assert!(!execute_pane_reap(&api2, &log, "r", "w6E:p9", PaneReap::Close("w6E:p9".into()), |_| {}).await);
+    }
+
+    #[tokio::test]
+    async fn refused_plan_sends_nothing() {
+        let d = tmpdir("refuse");
+        let (api, seen) = fake_herdr(&d, "ok").await;
+        let log = Logger::new(&d, false);
+        assert!(execute_pane_reap(&api, &log, "r", "w6E:p9", PaneReap::Refuse("x"), |_| panic!("marked")).await);
+        assert!(seen.lock().unwrap().is_empty());
+    }
 
     fn ws_entry(local: &str, tomb: bool) -> WsEntry {
         WsEntry {
@@ -2938,5 +3308,164 @@ mod tests {
         });
         let info: AgentInfo = serde_json::from_value(data).unwrap();
         assert!(!info.has_agent());
+    }
+
+    // --- M1 rev: copy found by streamer key, orphan sweep ---
+
+    use super::{collect_streamer_keys, plan_orphan_sweep, streamer_key, StreamerKeys};
+    use serde_json::{json, Value};
+
+    fn keys(pairs: &[(&str, &[&str])]) -> StreamerKeys {
+        pairs.iter().map(|(r, v)| (r.to_string(), v.iter().map(|s| s.to_string()).collect())).collect()
+    }
+
+    fn mirror_pane(id: &str) -> PaneInfo {
+        lpane(id, Some("/s/.mirror-pane"))
+    }
+
+    #[test]
+    fn streamer_key_reads_target_and_rid_from_argv() {
+        let a = |v: &[&str]| v.iter().map(|s| json!(s)).collect::<Vec<Value>>();
+        assert_eq!(
+            streamer_key(&a(&["/x/herdr-mirror", "pane", "win", "wN:p1", "--remote-bin", "h"])),
+            Some(("win".into(), "wN:p1".into()))
+        );
+        assert_eq!(streamer_key(&a(&["/x/herdr-mirror", "status"])), None);
+        assert_eq!(streamer_key(&a(&["ssh", "pane", "win", "wN:p1"])), None);
+    }
+
+    #[test]
+    fn stale_stored_id_still_closes_the_live_copy_found_by_key() {
+        // the observed case: stored id absent locally, copy alive under another id
+        let st = state_with("wN:p1", pane_entry("w6E:p1P6", false));
+        let sn = snap(vec![mirror_pane("w6E:p1Q0")], &["w6E:p1Q0"]);
+        let k = keys(&[("wN:p1", &["w6E:p1Q0"])]);
+        assert_eq!(plan_pane_reap("wN:p1", &st, &sn, &k), PaneReap::Close("w6E:p1Q0".into()));
+    }
+
+    #[test]
+    fn key_with_zero_hits_is_absent_and_several_hits_refuse() {
+        let st = state_with("wN:p1", pane_entry("w6E:p1P6", false));
+        let sn = snap(vec![mirror_pane("w6E:p1Q0"), mirror_pane("w6E:p1Q1")], &[]);
+        assert_eq!(plan_pane_reap("wN:p1", &st, &sn, &no_keys()), PaneReap::Absent);
+        let k = keys(&[("wN:p1", &["w6E:p1Q0", "w6E:p1Q1"])]);
+        assert!(matches!(plan_pane_reap("wN:p1", &st, &sn, &k), PaneReap::Refuse(_)));
+    }
+
+    #[test]
+    fn keyed_pane_that_is_another_entrys_copy_is_refused() {
+        let mut st = state_with("wN:p1", pane_entry("w6E:p1P6", false));
+        st.panes.insert("wN:p2".into(), pane_entry("w6E:p1Q0", false));
+        let sn = snap(vec![mirror_pane("w6E:p1Q0")], &[]);
+        let k = keys(&[("wN:p1", &["w6E:p1Q0"])]);
+        assert!(matches!(plan_pane_reap("wN:p1", &st, &sn, &k), PaneReap::Refuse(_)));
+    }
+
+    #[test]
+    fn orphan_is_closed_only_on_the_second_pass() {
+        let st = HostState::default();
+        let sn = snap(vec![mirror_pane("w6E:p1Q0")], &[]);
+        let k = keys(&[("wN:p9", &["w6E:p1Q0"])]);
+        let remote: HashSet<&str> = HashSet::new();
+        let (close1, seen1) = plan_orphan_sweep(&st, &sn, &remote, &k, &Default::default());
+        assert!(close1.is_empty());
+        assert!(seen1.contains("w6E:p1Q0"));
+        let (close2, _) = plan_orphan_sweep(&st, &sn, &remote, &k, &seen1);
+        assert_eq!(close2, vec![("wN:p9".to_string(), "w6E:p1Q0".to_string())]);
+    }
+
+    #[test]
+    fn sweep_spares_mapped_remote_alive_foreign_agent_and_non_mirror() {
+        let prev: std::collections::BTreeSet<String> =
+            ["m1", "m2", "m3", "m4", "m5"].iter().map(|s| s.to_string()).collect();
+        // m1: rid mapped; m2: rid alive on the remote; m3: local id mapped under
+        // another rid; m4: live non-mirror agent; m5: not a mirror pane at all
+        let mut st = state_with("r1", pane_entry("zz", false));
+        st.panes.insert("rX".into(), pane_entry("m3", false));
+        let sn = snap(
+            vec![mirror_pane("m1"), mirror_pane("m2"), mirror_pane("m3"), lpane("m4", Some("/home/u")), lpane("m5", Some("/home/u"))],
+            &["m4"],
+        );
+        let k = keys(&[("r1", &["m1"]), ("r2", &["m2"]), ("r3", &["m3"]), ("r4", &["m4"]), ("r5", &["m5"])]);
+        let remote: HashSet<&str> = ["r2"].into_iter().collect();
+        let (close, _) = plan_orphan_sweep(&st, &sn, &remote, &k, &prev);
+        assert!(close.is_empty(), "{close:?}");
+    }
+
+    #[tokio::test]
+    async fn collect_keys_via_process_info_on_fake_socket() {
+        let d = tmpdir("keys");
+        let (api, seen) = fake_herdr_with(&d, |m, p| {
+            assert_eq!(m, "pane.process_info");
+            let rid = if p["pane_id"] == "w6E:p1Q0" { "wN:p1" } else { "wN:p2" };
+            Ok(json!({"process_info": {"foreground_processes": [
+                {"argv": ["/b/herdr-mirror", "pane", if p["pane_id"] == "other" { "elsewhere" } else { "win" }, rid]}
+            ]}}))
+        })
+        .await;
+        let sn = snap(vec![mirror_pane("w6E:p1Q0"), mirror_pane("w6E:p1Q1"), lpane("w6E:p1Q2", Some("/home/u"))], &[]);
+        let k = collect_streamer_keys(&api, &sn, "win").await;
+        assert_eq!(k.get("wN:p1").unwrap(), &vec!["w6E:p1Q0".to_string()]);
+        assert_eq!(k.get("wN:p2").unwrap(), &vec!["w6E:p1Q1".to_string()]);
+        // the non-mirror pane is never even probed
+        assert_eq!(seen.lock().unwrap().len(), 2);
+        let k2 = collect_streamer_keys(&api, &sn, "other-host").await;
+        assert!(k2.is_empty());
+    }
+
+    #[tokio::test]
+    async fn end_to_end_stale_id_orphan_gets_closed_over_fake_socket() {
+        let d = tmpdir("e2e");
+        let (api, seen) = fake_herdr_with(&d, |m, p| match m {
+            "pane.process_info" => Ok(json!({"process_info": {"foreground_processes": [
+                {"argv": ["/b/herdr-mirror", "pane", "win", "wN:p1"]}]}})),
+            "pane.close" => {
+                assert_eq!(p["pane_id"], "w6E:p1Q0");
+                Ok(json!({}))
+            }
+            other => Err(format!("unexpected {other}")),
+        })
+        .await;
+        let log = Logger::new(&d, false);
+        let st = state_with("wN:p1", pane_entry("w6E:p1P6", false));
+        let sn = snap(vec![mirror_pane("w6E:p1Q0")], &[]);
+        let k = collect_streamer_keys(&api, &sn, "win").await;
+        let plan = plan_pane_reap("wN:p1", &st, &sn, &k);
+        assert!(execute_pane_reap(&api, &log, "wN:p1", "w6E:p1P6", plan, |_| {}).await);
+        let s = seen.lock().unwrap();
+        assert_eq!(s.last().unwrap().0, "pane.close");
+        assert_eq!(s.last().unwrap().1["pane_id"], "w6E:p1Q0");
+    }
+
+    /// Fake herdr socket with a per-request handler (Err => error response).
+    async fn fake_herdr_with(
+        dir: &std::path::Path,
+        handler: impl Fn(&str, &Value) -> std::result::Result<Value, String> + Send + Sync + 'static,
+    ) -> (ApiClient, Arc<Mutex<Vec<(String, Value)>>>) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let path = dir.join("fake2.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (seen2, handler) = (seen.clone(), Arc::new(handler));
+        tokio::spawn(async move {
+            loop {
+                let Ok((st, _)) = listener.accept().await else { return };
+                let (seen, handler) = (seen2.clone(), handler.clone());
+                tokio::spawn(async move {
+                    let (r, mut w) = st.into_split();
+                    if let Ok(Some(l)) = BufReader::new(r).lines().next_line().await {
+                        let v: Value = serde_json::from_str(&l).unwrap();
+                        let (m, p) = (v["method"].as_str().unwrap().to_string(), v["params"].clone());
+                        seen.lock().unwrap().push((m.clone(), p.clone()));
+                        let out = match handler(&m, &p) {
+                            Ok(r) => json!({"id": v["id"], "result": r}),
+                            Err(e) => json!({"id": v["id"], "error": {"message": e}}),
+                        };
+                        let _ = w.write_all((out.to_string() + "\n").as_bytes()).await;
+                    }
+                });
+            }
+        });
+        (ApiClient::connect_unchecked(&path), seen)
     }
 }

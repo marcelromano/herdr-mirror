@@ -59,6 +59,14 @@ impl ApiClient {
         Ok(client)
     }
 
+    #[cfg(test)]
+    pub fn connect_unchecked(socket_path: &Path) -> ApiClient {
+        ApiClient {
+            socket_path: socket_path.to_path_buf(),
+            mock: None,
+        }
+    }
+
     /// One request on a fresh connection; the server closes after responding.
     pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
         #[cfg(test)]

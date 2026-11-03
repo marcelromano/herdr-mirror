@@ -79,6 +79,11 @@ pub struct HostState {
     /// so a remote that reconnects mid-restore doesn't mass-close mirrors.
     #[serde(default)]
     pub prev_remote_ids: std::collections::BTreeSet<String>,
+    /// local ids of mirror panes seen orphaned (streaming a remote pane that is
+    /// neither mapped nor on the remote) in the previous converge; closed only
+    /// when still orphaned on the next one
+    #[serde(default)]
+    pub orphan_seen: std::collections::BTreeSet<String>,
     /// last split ratio both sides agreed on, keyed `<remote tab id>|<path>`
     /// (see layout_sync::path_key). This is the base of the three-way merge
     /// that makes ratio sync two-way: without it a converge can see that the

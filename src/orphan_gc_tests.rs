@@ -367,3 +367,17 @@ async fn partial_panes_are_spared_without_aborting_sweep() {
     assert_eq!(closed, vec!["p0".to_string(), "p1".to_string()]);
     assert!(!f.state.orphan_candidates.contains_key("p2"));
 }
+#[tokio::test]
+async fn gc_plan_is_read_only() {
+    let f = Fixture::new(3);
+    {
+        let mut s = f.snapshot.lock().unwrap();
+        s["panes"][1].as_object_mut().unwrap().remove("terminal_id");
+    }
+    let lines = plan(&f.deps.local, &f.deps.state_dir, "vps", &f.state).await;
+    assert_eq!(f.count(), 0, "plan must never close");
+    let all = lines.join("\n");
+    assert!(all.contains("WOULD-CLOSE pane=p0"), "{all}");
+    assert!(all.contains("SPARED-PARTIAL pane=p1"), "{all}");
+    assert!(!all.contains("WOULD-CLOSE pane=p1"), "{all}");
+}

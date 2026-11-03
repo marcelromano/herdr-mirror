@@ -20,6 +20,20 @@ use crate::util::{Logger, Result};
 #[path = "orphan_gc.rs"]
 mod orphan_gc;
 
+/// `herdr-mirror gc-plan`: read-only report of what orphan GC would do. Never
+/// writes to Herdr, never saves state, never contacts the daemon or remotes.
+pub async fn cmd_gc_plan(env: crate::util::Env) -> Result<()> {
+    let config = crate::config::load_config(&env.config_search)?;
+    let local = ApiClient::connect(&env.local_socket).await?;
+    for h in &config.hosts {
+        let state = load_state(&env.state_dir, &h.name);
+        for line in orphan_gc::plan(&local, &env.state_dir, &h.name, &state).await {
+            println!("{line}");
+        }
+    }
+    Ok(())
+}
+
 // --- snapshot shapes (subset of the API's SessionSnapshot) ---
 
 #[derive(Debug, Clone, Deserialize)]

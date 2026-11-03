@@ -93,6 +93,7 @@ fn run_on(rt: &tokio::runtime::Runtime, cmd: &str, rest: &[String]) -> Result<()
             Ok(())
         }
         "status" => rt.block_on(daemon::cmd_status(&Env::resolve()?)),
+        "gc-plan" => rt.block_on(mirror::cmd_gc_plan(Env::resolve()?)),
         "once" => rt.block_on(daemon::cmd_once(Env::resolve()?)),
         "restore" => daemon::cmd_restore(
             &Env::resolve()?,

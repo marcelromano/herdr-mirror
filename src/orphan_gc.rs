@@ -307,3 +307,53 @@ async fn run(deps: &ConvergeDeps, state: &mut HostState) -> Result<()> {
     }
     Ok(())
 }
+
+/// Read-only dry run of the sweep: same `inventory`/`eligible`/`identity`/`idle`
+/// as `run`, but it only holds `&ApiClient` and issues only `session.snapshot`
+/// and `pane.process_info`. There is no close call in this function.
+pub(super) async fn plan(
+    local: &ApiClient,
+    state_dir: &std::path::Path,
+    host: &str,
+    state: &HostState,
+) -> Vec<String> {
+    let map = format!("{host}-map.json");
+    let inv = match inventory(local).await {
+        Ok(i) => i,
+        Err(e) => return vec![format!("[{host}] ABORT: {e} (map={map})")],
+    };
+    let marker = match std::fs::canonicalize(mirror_pane_cwd(state_dir)) {
+        Ok(m) => m,
+        Err(e) => return vec![format!("[{host}] ABORT: marker dir: {e} (map={map})")],
+    };
+    let mut out = Vec::new();
+    for p in &inv.panes {
+        let id = text(p, "pane_id").unwrap_or("?");
+        let s = |k: &str| text(p, k).unwrap_or("-");
+        if inv.partial.contains(id) {
+            out.push(format!(
+                "[{host}] SPARED-PARTIAL pane={id} ws={} tab={} cwd={} agent_status={} map={map}",
+                s("workspace_id"), s("tab_id"), s("cwd"), s("agent_status")
+            ));
+            continue;
+        }
+        if !eligible(&inv, p, state) || identity(p, &marker, 0).is_none() {
+            continue;
+        }
+        let idle_now = match local.pane_process_info(id).await {
+            Ok(i) => idle(&i, id, &marker),
+            Err(_) => false,
+        };
+        out.push(format!(
+            "[{host}] WOULD-CLOSE pane={id} ws={} tab={} cwd={} agent={} agent_status={} label={} idle={idle_now} map={map} (daemon also needs age>={MIN_AGE}s + 2 sightings)",
+            s("workspace_id"), s("tab_id"), s("cwd"),
+            p.get("agent").and_then(Value::as_str).unwrap_or("none"),
+            s("agent_status"),
+            crate::mirror::pane_rid(p).map(|r| format!("mirror:{r}")).unwrap_or_else(|| "-".into()),
+        ));
+    }
+    if out.is_empty() {
+        out.push(format!("[{host}] nothing to close (panes={})", inv.panes.len()));
+    }
+    out
+}

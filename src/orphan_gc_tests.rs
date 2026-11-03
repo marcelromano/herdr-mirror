@@ -7,6 +7,7 @@ struct Fixture {
     snapshot: Arc<Mutex<Value>>,
     closed: Arc<Mutex<Vec<String>>>,
     mode: Arc<Mutex<String>>,
+    remote_panes: Arc<Mutex<Vec<String>>>,
 }
 impl Fixture {
     fn new(count: usize) -> Self {
@@ -60,9 +61,17 @@ impl Fixture {
                     }
                     Ok(json!({"pane":p}))
                 }
-                "pane.process_info" => Ok(
-                    json!({"process_info":{"pane_id":id,"shell_pid":42,"foreground_process_group_id":42,"foreground_processes":[{"pid":42,"name":"sh","argv":["sh"],"cwd":marker}]}}),
-                ),
+                "pane.process_info" => {
+                    let argv = s["panes"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|p| text(p, "pane_id") == Some(id))
+                        .and_then(|p| p.get("_argv").cloned())
+                        .unwrap_or(json!(["sh"]));
+                    Ok(
+                    json!({"process_info":{"pane_id":id,"shell_pid":42,"foreground_process_group_id":42,"foreground_processes":[{"pid":42,"name":"sh","argv":argv,"cwd":marker}]}}),
+                )}
                 "pane.close" => {
                     c.lock().unwrap().push(id.to_string());
                     s["panes"]
@@ -81,6 +90,8 @@ impl Fixture {
                 _ => panic!("unexpected {method}"),
             }
         });
+        let remote_panes: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let rp = remote_panes.clone();
         let host = HostConfig {
             name: "vps".into(),
             target: "vps".into(),
@@ -98,9 +109,9 @@ impl Fixture {
         let deps = ConvergeDeps {
             orphan_gc: true,
             local: api,
-            remote: ApiClient::mock(|method, _| {
+            remote: ApiClient::mock(move |method, _| {
                 assert_eq!(method, "session.snapshot");
-                Ok(json!({"snapshot":{}}))
+                Ok(json!({"snapshot":{"panes":rp.lock().unwrap().iter().map(|r| json!({"pane_id":r,"workspace_id":"x","tab_id":"x","focused":false,"agent_status":"unknown","revision":1})).collect::<Vec<_>>()}}))
             }),
             host,
             state_dir: dir.clone(),
@@ -118,6 +129,7 @@ impl Fixture {
             snapshot,
             closed,
             mode,
+            remote_panes,
         }
     }
     async fn plan(&mut self) {
@@ -332,16 +344,56 @@ fn unknown_process_is_not_idle() {
     ));
 }
 
+fn streamer(target: &str, rid: &str) -> Value {
+    json!(["/bin/herdr-mirror", "pane", target, rid, "--always-control"])
+}
 #[test]
-fn rid_label_roundtrip_and_unmapped_mark_not_collected() {
-    let p = json!({"label": crate::mirror::rid_label("w7:p15")});
-    assert_eq!(crate::mirror::pane_rid(&p), Some("w7:p15"));
-    assert_eq!(crate::mirror::pane_rid(&json!({"label":"mirror:"})), None);
-    assert_eq!(crate::mirror::pane_rid(&json!({"label":"x"})), None);
-    let inv = Inventory { panes: vec![], agents: vec![], partial: Default::default() };
-    let st = HostState::default();
-    let marked = json!({"pane_id":"p9","workspace_id":"w","label":"mirror:w7:p15"});
-    assert!(!eligible(&inv, &marked, &st));
+fn argv_mark_parses_streamer_only() {
+    let info = |a: Value| json!({"foreground_processes":[{"argv":a}]});
+    assert_eq!(argv_mark(&info(streamer("vps", "w1:p2"))), Some(("vps".into(), "w1:p2".into())));
+    assert_eq!(argv_mark(&info(json!(["sh"]))), None);
+    assert_eq!(argv_mark(&info(json!(["x", "pane", "vps"]))), None);
+    assert_eq!(argv_mark(&json!({})), None);
+}
+#[tokio::test]
+async fn adoption_finds_copy_by_argv_and_never_splits() {
+    let mut f = Fixture::new(2);
+    f.snapshot.lock().unwrap()["panes"][1]["_argv"] = streamer("vps", "r9");
+    let find = |f: &Fixture, host: &str, rid: &str| {
+        let (l, d, st) = (f.deps.local.clone(), f.deps.state_dir.clone(), f.state.clone());
+        let (host, rid) = (host.to_string(), rid.to_string());
+        async move { find_copy(&l, &d, &host, &rid, &st).await }
+    };
+    assert_eq!(find(&f, "vps", "r9").await.as_deref(), Some("p1"));
+    // host mismatch and other rid are not adopted
+    assert_eq!(find(&f, "other", "r9").await, None);
+    assert_eq!(find(&f, "vps", "r8").await, None);
+    // the mock panics on pane.split/rename: reaching here proves none was issued
+    f.state.panes.insert("r9".into(), crate::state::PaneEntry { local_id: "zz".into(), tombstone: None, seq: 0, reported: None });
+    assert_eq!(find(&f, "vps", "r9").await, None);
+}
+#[tokio::test]
+async fn gc_spares_awaiting_adoption_but_collects_true_orphan() {
+    let mut f = Fixture::new(3);
+    f.snapshot.lock().unwrap()["panes"][1]["_argv"] = streamer("vps", "r9");
+    f.snapshot.lock().unwrap()["panes"][2]["_argv"] = streamer("vps", "gone");
+    f.remote_panes.lock().unwrap().push("r9".into());
+    f.plan().await;
+    f.age();
+    f.plan().await;
+    let closed = f.closed.lock().unwrap().clone();
+    assert!(!closed.contains(&"p1".to_string()), "awaiting adoption spared: {closed:?}");
+    assert!(closed.contains(&"p0".to_string()), "true orphan collected: {closed:?}");
+    assert!(closed.contains(&"p2".to_string()), "mark for vanished remote pane is an orphan: {closed:?}");
+}
+#[tokio::test]
+async fn gc_plan_reports_awaiting_and_is_read_only() {
+    let f = Fixture::new(3);
+    f.snapshot.lock().unwrap()["panes"][1]["_argv"] = streamer("vps", "r9");
+    let lines = plan(&f.deps.local, &f.deps.state_dir, "vps", "vps", &f.state).await;
+    assert!(lines.iter().any(|l| l.contains("SPARED-AWAITING-ADOPTION pane=p1")), "{lines:?}");
+    assert!(lines.iter().any(|l| l.contains("WOULD-CLOSE pane=p0")), "{lines:?}");
+    assert_eq!(f.closed.lock().unwrap().len(), 0);
 }
 #[tokio::test]
 async fn partial_panes_are_spared_without_aborting_sweep() {
@@ -374,7 +426,7 @@ async fn gc_plan_is_read_only() {
         let mut s = f.snapshot.lock().unwrap();
         s["panes"][1].as_object_mut().unwrap().remove("terminal_id");
     }
-    let lines = plan(&f.deps.local, &f.deps.state_dir, "vps", &f.state).await;
+    let lines = plan(&f.deps.local, &f.deps.state_dir, "vps", "vps", &f.state).await;
     assert_eq!(f.count(), 0, "plan must never close");
     let all = lines.join("\n");
     assert!(all.contains("WOULD-CLOSE pane=p0"), "{all}");

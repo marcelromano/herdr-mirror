@@ -27,7 +27,7 @@ pub async fn cmd_gc_plan(env: crate::util::Env) -> Result<()> {
     let local = ApiClient::connect(&env.local_socket).await?;
     for h in &config.hosts {
         let state = load_state(&env.state_dir, &h.name);
-        for line in orphan_gc::plan(&local, &env.state_dir, &h.name, &state).await {
+        for line in orphan_gc::plan(&local, &env.state_dir, &h.name, &h.target, &state).await {
             println!("{line}");
         }
     }
@@ -732,40 +732,12 @@ async fn split_mirror_pane(
         params["ratio"] = json!(r);
     }
     let split: Split = local.request_t("pane.split", params).await?;
-    // Env is invisible to the API; the label is what snapshots expose, so the
-    // GC and reconcile can recognise the copy by rid. Best effort.
-    let _ = local
-        .request(
-            "pane.rename",
-            json!({ "pane_id": split.pane.pane_id, "label": rid_label(rid) }),
-        )
-        .await;
     Ok(split.pane.pane_id)
 }
 
-/// Env var set on a mirror copy's shell: the remote pane id it mirrors.
+/// Env var set on a mirror copy's shell (informational only: the API cannot
+/// read it back; the durable marker is the streamer's argv, see orphan_gc).
 pub(crate) const RID_ENV: &str = "HERDR_MIRROR_RID";
-const RID_LABEL_PREFIX: &str = "mirror:";
-pub(crate) fn rid_label(rid: &str) -> String {
-    format!("{RID_LABEL_PREFIX}{rid}")
-}
-/// The rid a local pane's label marks it with, if any.
-pub(crate) fn pane_rid(p: &Value) -> Option<&str> {
-    p.get("label")?
-        .as_str()?
-        .strip_prefix(RID_LABEL_PREFIX)
-        .filter(|r| !r.is_empty())
-}
-/// A live local pane already marked for `rid` (1 copy per rid): adopt it
-/// rather than splitting a duplicate. None on any doubt, including API errors.
-async fn find_marked(local: &ApiClient, rid: &str) -> Option<String> {
-    let v = local.request("session.snapshot", json!({})).await.ok()?;
-    v["snapshot"]["panes"]
-        .as_array()?
-        .iter()
-        .find(|p| pane_rid(p) == Some(rid))
-        .and_then(|p| p["pane_id"].as_str().map(String::from))
-}
 
 /// Exec the streamer into an already-created plain pane. Not `agent.start` (or a
 /// layout `command`), which set `launch_argv` and would surface every mirror pane
@@ -1859,7 +1831,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                     else {
                         continue;
                     };
-                    let adopted = find_marked(&deps.local, &place.pane).await;
+                    let adopted = orphan_gc::find_copy(&deps.local, &deps.state_dir, &deps.host.target, &place.pane, state).await;
                     let was_adopted = adopted.is_some();
                     let local_id = match adopted {
                         Some(id) => id,
@@ -1943,7 +1915,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                         "{}: remote pane {} sits beside a subtree — mirroring it beside {target} instead; split sizes for this tab won't track",
                         rtab.tab_id, rp.pane_id
                     ));
-                    let local_id = match find_marked(&deps.local, &rp.pane_id).await {
+                    let local_id = match orphan_gc::find_copy(&deps.local, &deps.state_dir, &deps.host.target, &rp.pane_id, state).await {
                         Some(id) => id,
                         None => {
                             split_mirror_pane(

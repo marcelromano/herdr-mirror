@@ -195,16 +195,108 @@ async fn inventory(api: &ApiClient) -> Result<Inventory> {
         partial,
     })
 }
-fn eligible(inv: &Inventory, p: &Value, state: &HostState) -> bool {
+/// (ssh target, remote pane id) a streamer pane was launched for: its argv is
+/// `[bin, "pane", <target>, <rid>, ...]` (mirror::cmd_for_pane). Durable,
+/// readable through pane.process_info, and never touched by the sync.
+pub(crate) fn argv_mark(info: &Value) -> Option<(String, String)> {
+    let argv = info
+        .get("foreground_processes")?
+        .as_array()?
+        .first()?
+        .get("argv")?
+        .as_array()?;
+    let a = |i: usize| argv.get(i)?.as_str().map(String::from);
+    (a(1)? == "pane").then_some(())?;
+    Some((a(2)?, a(3)?)).filter(|(t, r)| !t.is_empty() && !r.is_empty())
+}
+/// Panes in the marker cwd, not mapped in `state`, whose streamer argv names
+/// (`target`, rid) with rid unmapped. Candidates for adoption; fail-closed on
+/// any read error is the caller's job (errors just skip the pane here).
+async fn unmapped_marks(
+    local: &ApiClient,
+    inv: &Inventory,
+    marker: &std::path::Path,
+    target: &str,
+    state: &HostState,
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for p in &inv.panes {
+        let Some(id) = text(p, "pane_id") else { continue };
+        if !owned_path(p, "cwd", marker)
+            || state.panes.values().any(|m| m.local_id == id)
+            || !state
+                .workspaces
+                .values()
+                .any(|w| !w.is_tombstoned() && Some(w.local_id.as_str()) == text(p, "workspace_id"))
+        {
+            continue;
+        }
+        let Ok(info) = local.pane_process_info(id).await else { continue };
+        if let Some((t, rid)) = argv_mark(&info) {
+            if t == target && !state.panes.contains_key(&rid) {
+                out.push((id.to_string(), rid));
+            }
+        }
+    }
+    out
+}
+/// Panes spared as awaiting adoption: unmapped mark whose rid is in the remote
+/// snapshot. With no remote client (gc-plan) or an unreadable remote, spare.
+async fn awaiting_set(
+    local: &ApiClient,
+    inv: &Inventory,
+    marker: &std::path::Path,
+    target: &str,
+    state: &HostState,
+    remote: Option<&ApiClient>,
+) -> HashSet<String> {
+    let marks = unmapped_marks(local, inv, marker, target, state).await;
+    if marks.is_empty() {
+        return HashSet::new();
+    }
+    let rids: Option<HashSet<String>> = match remote {
+        None => None,
+        Some(r) => crate::mirror::fetch_snapshot(r)
+            .await
+            .ok()
+            .map(|s| s.panes.into_iter().map(|p| p.pane_id).collect()),
+    };
+    marks
+        .into_iter()
+        .filter(|(_, rid)| rids.as_ref().is_none_or(|s| s.contains(rid)))
+        .map(|(id, _)| id)
+        .collect()
+}
+/// The live local copy already launched for (`target`, `rid`), if any: adopt it
+/// rather than splitting a duplicate. None on any doubt, including API errors.
+pub(super) async fn find_copy(
+    local: &ApiClient,
+    state_dir: &std::path::Path,
+    target: &str,
+    rid: &str,
+    state: &HostState,
+) -> Option<String> {
+    let marker = std::fs::canonicalize(mirror_pane_cwd(state_dir)).ok()?;
+    // not inventory(): its strict consistency checks can fail mid-reconcile
+    let snap = local.request("session.snapshot", json!({})).await.ok()?;
+    let panes = snap["snapshot"]["panes"].as_array()?.clone();
+    let inv = Inventory { panes, agents: vec![], partial: Default::default() };
+    unmapped_marks(local, &inv, &marker, target, state)
+        .await
+        .into_iter()
+        .find(|(_, r)| r == rid)
+        .map(|(id, _)| id)
+}
+fn eligible(inv: &Inventory, p: &Value, state: &HostState, awaiting: &HashSet<String>) -> bool {
     let Some(id) = text(p, "pane_id") else {
         return false;
     };
     if inv.partial.contains(id) {
         return false;
     }
-    // A copy marked with a rid the state doesn't know yet is awaiting adoption
-    // by reconcile; one whose rid maps elsewhere is a duplicate (fair game).
-    if crate::mirror::pane_rid(p).is_some_and(|r| !state.panes.contains_key(r)) {
+    // A copy whose streamer names a remote pane that still exists but isn't
+    // mapped yet is awaiting adoption by reconcile.
+    if awaiting.contains(id) {
         return false;
     }
     state
@@ -250,8 +342,9 @@ async fn run(deps: &ConvergeDeps, state: &mut HostState) -> Result<()> {
         .as_secs();
     let old = std::mem::take(&mut state.orphan_candidates);
     let mut closes = 0;
+    let awaiting = awaiting_set(&deps.local, &inv, &marker, &deps.host.target, state, Some(&deps.remote)).await;
     for p in &inv.panes {
-        if !eligible(&inv, p, state) {
+        if !eligible(&inv, p, state, &awaiting) {
             continue;
         }
         let id = text(p, "pane_id").unwrap();
@@ -274,11 +367,12 @@ async fn run(deps: &ConvergeDeps, state: &mut HostState) -> Result<()> {
         }
         // Recount before EACH close, including successful closes earlier this pass.
         let fresh = inventory(&deps.local).await?;
+        let fresh_awaiting = awaiting_set(&deps.local, &fresh, &marker, &deps.host.target, state, Some(&deps.remote)).await;
         let Some(current) = fresh.panes.iter().find(|v| text(v, "pane_id") == Some(id)) else {
             state.orphan_candidates.remove(id);
             continue;
         };
-        if !eligible(&fresh, current, state)
+        if !eligible(&fresh, current, state, &fresh_awaiting)
             || !identity(current, &marker, now).is_some_and(|c| same(&candidate, &c))
         {
             state.orphan_candidates.remove(id);
@@ -315,6 +409,7 @@ pub(super) async fn plan(
     local: &ApiClient,
     state_dir: &std::path::Path,
     host: &str,
+    target: &str,
     state: &HostState,
 ) -> Vec<String> {
     let map = format!("{host}-map.json");
@@ -326,9 +421,16 @@ pub(super) async fn plan(
         Ok(m) => m,
         Err(e) => return vec![format!("[{host}] ABORT: marker dir: {e} (map={map})")],
     };
+    // gc-plan never contacts the remote: an unmapped streamer mark is spared
+    // without checking the remote still has that pane.
+    let awaiting = awaiting_set(local, &inv, &marker, target, state, None).await;
     let mut out = Vec::new();
     for p in &inv.panes {
         let id = text(p, "pane_id").unwrap_or("?");
+        if awaiting.contains(id) {
+            out.push(format!("[{host}] SPARED-AWAITING-ADOPTION pane={id} (streamer names an unmapped remote pane) map={map}"));
+            continue;
+        }
         let s = |k: &str| text(p, k).unwrap_or("-");
         if inv.partial.contains(id) {
             out.push(format!(
@@ -337,7 +439,7 @@ pub(super) async fn plan(
             ));
             continue;
         }
-        if !eligible(&inv, p, state) || identity(p, &marker, 0).is_none() {
+        if !eligible(&inv, p, state, &awaiting) || identity(p, &marker, 0).is_none() {
             continue;
         }
         let idle_now = match local.pane_process_info(id).await {
@@ -345,11 +447,10 @@ pub(super) async fn plan(
             Err(_) => false,
         };
         out.push(format!(
-            "[{host}] WOULD-CLOSE pane={id} ws={} tab={} cwd={} agent={} agent_status={} label={} idle={idle_now} map={map} (daemon also needs age>={MIN_AGE}s + 2 sightings)",
+            "[{host}] WOULD-CLOSE pane={id} ws={} tab={} cwd={} agent={} agent_status={} idle={idle_now} map={map} (daemon also needs age>={MIN_AGE}s + 2 sightings)",
             s("workspace_id"), s("tab_id"), s("cwd"),
             p.get("agent").and_then(Value::as_str).unwrap_or("none"),
             s("agent_status"),
-            crate::mirror::pane_rid(p).map(|r| format!("mirror:{r}")).unwrap_or_else(|| "-".into()),
         ));
     }
     if out.is_empty() {

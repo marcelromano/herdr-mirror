@@ -338,8 +338,32 @@ fn rid_label_roundtrip_and_unmapped_mark_not_collected() {
     assert_eq!(crate::mirror::pane_rid(&p), Some("w7:p15"));
     assert_eq!(crate::mirror::pane_rid(&json!({"label":"mirror:"})), None);
     assert_eq!(crate::mirror::pane_rid(&json!({"label":"x"})), None);
-    let inv = Inventory { panes: vec![], agents: vec![] };
+    let inv = Inventory { panes: vec![], agents: vec![], partial: Default::default() };
     let st = HostState::default();
     let marked = json!({"pane_id":"p9","workspace_id":"w","label":"mirror:w7:p15"});
     assert!(!eligible(&inv, &marked, &st));
+}
+#[tokio::test]
+async fn partial_panes_are_spared_without_aborting_sweep() {
+    // Shape of a real local snapshot, anonymized: plain shell panes omit the
+    // `agent` key entirely (agent_status "unknown"), other fields present.
+    let mut f = Fixture::new(3);
+    {
+        let mut s = f.snapshot.lock().unwrap();
+        for i in 0..3 {
+            let p = s["panes"][i].as_object_mut().unwrap();
+            p.insert("terminal_title".into(), json!("TITLE"));
+            p.insert("terminal_title_stripped".into(), json!("TITLE"));
+            p.insert("focused".into(), json!(false));
+            p.insert("scroll".into(), json!({"offset":0}));
+        }
+        s["panes"][1].as_object_mut().unwrap().remove("agent");
+        s["panes"][2].as_object_mut().unwrap().remove("terminal_id");
+    }
+    f.plan().await;
+    f.age();
+    f.plan().await;
+    let closed = f.closed.lock().unwrap().clone();
+    assert_eq!(closed, vec!["p0".to_string(), "p1".to_string()]);
+    assert!(!f.state.orphan_candidates.contains_key("p2"));
 }

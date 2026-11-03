@@ -20,7 +20,7 @@ fn owned_path(v: &Value, key: &str, marker: &std::path::Path) -> bool {
         == Some(marker)
 }
 fn bare(p: &Value, marker: &std::path::Path) -> bool {
-    p.get("agent").is_some_and(Value::is_null)
+    p.get("agent").is_none_or(Value::is_null)
         && text(p, "agent_status") == Some("unknown")
         && p.get("revision").and_then(Value::as_u64).is_some()
         && owned_path(p, "cwd", marker)
@@ -78,6 +78,8 @@ fn idle(info: &Value, id: &str, marker: &std::path::Path) -> bool {
 struct Inventory {
     panes: Vec<Value>,
     agents: Vec<Value>,
+    /// Panes missing terminal_id / agent_status / malformed agent: unknown, never collected.
+    partial: HashSet<String>,
 }
 async fn inventory(api: &ApiClient) -> Result<Inventory> {
     let response = api.request("session.snapshot", json!({})).await?;
@@ -156,15 +158,20 @@ async fn inventory(api: &ApiClient) -> Result<Inventory> {
             return Err(err("GC layout mismatch"));
         }
     }
+    let mut partial = HashSet::new();
     for p in &panes {
         if !tabs.iter().any(|t| {
             text(t, "tab_id") == text(p, "tab_id")
                 && text(t, "workspace_id") == text(p, "workspace_id")
-        }) || text(p, "terminal_id").is_none()
-            || text(p, "agent_status").is_none()
-            || !p.get("agent").is_some_and(|a| a.is_null() || a.is_string())
-        {
+        }) {
             return Err(err("GC partial pane"));
+        }
+        if text(p, "terminal_id").is_none()
+            || text(p, "agent_status").is_none()
+            || !p.get("agent").is_none_or(|a| a.is_null() || a.is_string())
+        {
+            // Missing `agent` key = no agent (like null). Partial = unknown => spared.
+            partial.insert(text(p, "pane_id").unwrap_or_default().to_string());
         }
         // A live agent must also occur in agents[]. Missing rows are unknown.
         if p["agent"].is_string()
@@ -182,12 +189,19 @@ async fn inventory(api: &ApiClient) -> Result<Inventory> {
     }) {
         return Err(err("GC foreign agent"));
     }
-    Ok(Inventory { panes, agents })
+    Ok(Inventory {
+        panes,
+        agents,
+        partial,
+    })
 }
 fn eligible(inv: &Inventory, p: &Value, state: &HostState) -> bool {
     let Some(id) = text(p, "pane_id") else {
         return false;
     };
+    if inv.partial.contains(id) {
+        return false;
+    }
     // A copy marked with a rid the state doesn't know yet is awaiting adoption
     // by reconcile; one whose rid maps elsewhere is a duplicate (fair game).
     if crate::mirror::pane_rid(p).is_some_and(|r| !state.panes.contains_key(r)) {
